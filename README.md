@@ -48,6 +48,26 @@ Rebroadcast's prebuffered streams (prebuffer and record the other one for
 HomeKit Secure Video), so its session only runs while a viewer is there.
 Drive the switch from presence automations in the Home app.
 
+## Doorbells, events and talk-back from other apps
+
+A camera with a HomeKit doorbell service becomes a Scrypted doorbell: a press
+turns its binary state on, which the Scrypted HomeKit plugin rings with.
+
+Plugin settings, **Event Webhook**: each ring and motion change is posted as
+`{"camera", "event": "ring" | "motion", "state"}`, without delaying the
+event. A Home Assistant webhook trigger feeding template binary sensors turns
+them into entities.
+
+Camera settings, **Talk-back Port**: a TCP client sending raw s16le 16 kHz
+mono PCM talks through the camera for as long as it stays connected. The PCM
+goes straight to the AAC-ELD encoder, with no ffmpeg in the path.
+
+`GET http://<scrypted>:11080/endpoint/scrypted-homekit-camera/public/watch?camera=<name>&watching=1|0`
+lets a viewer outside HomeKit (a dashboard) hold a watch lease: renew it every
+few seconds while its live view is open and release it on close, and a
+pan/tilt camera turns right away instead of waiting for the stream to wind
+down. An unrenewed lease lapses after 15 s.
+
 ## Cameras
 
 Each camera is an aiohomekit pairing file named after the device:
