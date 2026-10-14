@@ -62,6 +62,9 @@ class DeviceManager:
     def getDeviceStorage(self, nativeId):
         return Storage()
 
+    def getNativeIds(self):
+        return []
+
 
 sdk = types.ModuleType("scrypted_sdk")
 sdk.ScryptedDeviceBase = ScryptedDeviceBase

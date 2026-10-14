@@ -339,6 +339,9 @@ class HomeKitCamera(ScryptedDeviceBase, VideoCamera, MotionSensor, BinarySensor,
             print(f"cannot load presets: {exc}")
             return
         self.ptzCapabilities = {"pan": False, "tilt": False, "zoom": False, "presets": {name: name for name in self.presets}}
+        if self.presets and not self.storage.getItem("ptz"):
+            self.storage.setItem("ptz", "true")
+            await scrypted_sdk.deviceManager.onDeviceDiscovered(self.plugin.privacy_manifest(self.nativeId))
         await self.update_position()
 
     async def ptzCommand(self, command: dict) -> None:
@@ -542,15 +545,13 @@ class HomeKitCamerasPlugin(ScryptedDeviceBase, DeviceProvider, Settings, HttpReq
         self.controller = Controller(async_zeroconf_instance=zeroconf, char_cache=CharacteristicCacheMemory())
         await self.controller.async_start()
         devices = []
+        existing = set(scrypted_sdk.deviceManager.getNativeIds())
         for path in sorted(PAIRINGS_DIR.glob("*.pairing")):
-            doorbell = bool(scrypted_sdk.deviceManager.getDeviceStorage(path.stem).getItem("doorbell"))
-            devices.append(self.manifest(path.stem, doorbell))
-            devices.append({
-                "nativeId": path.stem + PRIVACY_SUFFIX,
-                "name": f"{path.stem} Privacy",
-                "type": ScryptedDeviceType.Switch.value,
-                "interfaces": [ScryptedInterface.OnOff.value],
-            })
+            storage = scrypted_sdk.deviceManager.getDeviceStorage(path.stem)
+            devices.append(self.manifest(path.stem, bool(storage.getItem("doorbell"))))
+            # Only pan/tilt cameras get a privacy switch, once their presets have shown up.
+            if storage.getItem("ptz") or path.stem + PRIVACY_SUFFIX in existing:
+                devices.append(self.privacy_manifest(path.stem))
         await scrypted_sdk.deviceManager.onDevicesChanged({"devices": devices})
 
     def manifest(self, nativeId: str, doorbell: bool = False) -> dict:
@@ -567,6 +568,14 @@ class HomeKitCamerasPlugin(ScryptedDeviceBase, DeviceProvider, Settings, HttpReq
             "type": (ScryptedDeviceType.Doorbell if doorbell else ScryptedDeviceType.Camera).value,
             "interfaces": interfaces + ([ScryptedInterface.BinarySensor.value] if doorbell else []),
             "info": {"manufacturer": "HomeKit"},
+        }
+
+    def privacy_manifest(self, nativeId: str) -> dict:
+        return {
+            "nativeId": nativeId + PRIVACY_SUFFIX,
+            "name": f"{nativeId} Privacy",
+            "type": ScryptedDeviceType.Switch.value,
+            "interfaces": [ScryptedInterface.OnOff.value],
         }
 
     def notify(self, camera: str, event: str, state: bool) -> None:
