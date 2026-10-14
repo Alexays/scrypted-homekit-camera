@@ -32,6 +32,17 @@ negotiation, SRTP keys, and the
 AAC-ELD framing (480-sample frames, one access unit per packet) the cameras
 expect for talk-back.
 
+## Audio for other consumers
+
+HomeKit cameras send AAC-ELD with 480-sample frames, which ffmpeg's built-in
+AAC decoder rejects ("Internal bug, should not have happened"); Apple's
+AudioToolbox decoder (`aac_at`) handles it. Anything that transcodes the
+audio (HomeKit Secure Video, Home Assistant, an HLS restreamer) therefore
+needs Rebroadcast to hand out AAC-LC instead. For each stream, set:
+
+- FFmpeg Input Arguments Prefix: `-fflags +genpts -c:a aac_at`
+- FFmpeg Output Prefix: `-vcodec copy -acodec aac -ar 16000 -ac 1 -b:a 32k`
+
 ## Pan/tilt and privacy
 
 Aqara cameras such as the E1 take pan/tilt moves only from the Aqara cloud:
