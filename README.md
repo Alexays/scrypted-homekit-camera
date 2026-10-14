@@ -11,6 +11,24 @@ into Scrypted. The plugin is the camera's HomeKit controller:
 A HomeKit accessory accepts a single controller, so a camera used here is not
 in the Apple Home app directly; re-expose it with the Scrypted HomeKit plugin.
 
+## Why
+
+Some cameras speak only HomeKit: no RTSP, no ONVIF, no local API. Their video
+is reachable only through Apple Home, so nothing else on the network can use
+it. Home Assistant's HomeKit Controller integration fetches snapshots, never
+the live stream or the talk-back channel.
+
+Making Scrypted the controller turns such a camera into a regular one:
+Rebroadcast prebuffers it, the HomeKit plugin puts it back in Apple Home with
+HomeKit Secure Video and two-way audio, and its RTSP rebroadcast feeds Home
+Assistant, NVRs or dashboards, all locally.
+
+aiohomekit, the controller library behind Home Assistant, does not implement
+the streaming side of HAP, so this relies on a fork that adds it: stream
+negotiation, SRTP keys, and the
+AAC-ELD framing (480-sample frames, one access unit per packet) the cameras
+expect for talk-back.
+
 ## Cameras
 
 Each camera is an aiohomekit pairing file named after the device:
