@@ -545,12 +545,13 @@ class HomeKitCamerasPlugin(ScryptedDeviceBase, DeviceProvider, Settings, HttpReq
         self.controller = Controller(async_zeroconf_instance=zeroconf, char_cache=CharacteristicCacheMemory())
         await self.controller.async_start()
         devices = []
-        existing = set(scrypted_sdk.deviceManager.getNativeIds())
         for path in sorted(PAIRINGS_DIR.glob("*.pairing")):
+            # The runtime has no storage yet for a device it has never seen.
             storage = scrypted_sdk.deviceManager.getDeviceStorage(path.stem)
-            devices.append(self.manifest(path.stem, bool(storage.getItem("doorbell"))))
-            # Only pan/tilt cameras get a privacy switch, once their presets have shown up.
-            if storage.getItem("ptz") or path.stem + PRIVACY_SUFFIX in existing:
+            devices.append(self.manifest(path.stem, bool(storage and storage.getItem("doorbell"))))
+            # Only pan/tilt cameras get a privacy switch, once their presets have shown up; an existing one stays.
+            has_privacy = scrypted_sdk.deviceManager.getDeviceStorage(path.stem + PRIVACY_SUFFIX) is not None
+            if has_privacy or (storage and storage.getItem("ptz")):
                 devices.append(self.privacy_manifest(path.stem))
         await scrypted_sdk.deviceManager.onDevicesChanged({"devices": devices})
 

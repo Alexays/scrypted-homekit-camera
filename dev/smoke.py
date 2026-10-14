@@ -60,10 +60,7 @@ class DeviceManager:
         print(f"[sdk] device updated: {device['nativeId']} ({device['type']})")
 
     def getDeviceStorage(self, nativeId):
-        return Storage()
-
-    def getNativeIds(self):
-        return []
+        return None  # like the runtime, for a device it has never seen
 
 
 sdk = types.ModuleType("scrypted_sdk")
