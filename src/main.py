@@ -69,6 +69,8 @@ RING_HOLD = 5
 # A viewer outside HomeKit (a dashboard) renews its watch lease every few seconds; a lapsed lease
 # means it went away without saying so.
 VIEW_LEASE = 15
+# Stream id suffix of a stream's live variant: it shares the session, and its consumer means someone watches.
+LIVE_SUFFIX = "-live"
 
 STREAM_CHARACTERISTICS = {
     "streaming_status": CharacteristicsTypes.STREAMING_STATUS,
@@ -93,33 +95,54 @@ def _free_port_pair() -> int:
                 continue
 
 
-class Relay(asyncio.DatagramProtocol):
-    """Forwards the accessory's SRTP packets untouched to the consumer's ffmpeg on localhost."""
+class Consumer:
+    """One ffmpeg reading a session from localhost; a live viewer and the prebuffer can share one session."""
 
-    def __init__(self, port: int) -> None:
-        self.out = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.out.setblocking(False)
-        self.out.connect(("127.0.0.1", port))
+    def __init__(self, live: bool, sdp_path: Path) -> None:
+        self.live = live
+        self.sdp_path = sdp_path
+        self.video_port, self.audio_port = _free_port_pair(), _free_port_pair()
+        outs = []
+        for port in (self.video_port, self.audio_port):
+            out = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            out.setblocking(False)
+            out.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, UDP_BUFFER)
+            out.connect(("127.0.0.1", port))
+            outs.append(out)
+        self.video, self.audio = outs
+        self.started = time.monotonic()
+        self.last_refused = 0.0
+
+    def close(self) -> None:
+        self.video.close()
+        self.audio.close()
+
+
+class Relay(asyncio.DatagramProtocol):
+    """Forwards the accessory's SRTP packets untouched to every consumer's ffmpeg on localhost."""
+
+    def __init__(self, stream: Stream, video: bool) -> None:
+        self.stream = stream
+        self.video = video
         self.transport: asyncio.DatagramTransport | None = None
         self.last_packet = time.monotonic()
-        self.last_refused = 0.0
 
     def connection_made(self, transport) -> None:
         self.transport = transport
 
     def datagram_received(self, data: bytes, addr) -> None:
         self.last_packet = time.monotonic()
-        try:
-            self.out.send(data)
-        except ConnectionRefusedError:
-            # Nobody listens on the consumer port: ffmpeg has not opened the SDP yet, or has exited.
-            self.last_refused = self.last_packet
-        except BlockingIOError:
-            pass
+        for consumer in self.stream.consumers:
+            try:
+                (consumer.video if self.video else consumer.audio).send(data)
+            except ConnectionRefusedError:
+                # Nobody listens on the consumer port: ffmpeg has not opened the SDP yet, or has exited.
+                consumer.last_refused = self.last_packet
+            except BlockingIOError:
+                pass
 
     def close(self) -> None:
         self.transport.close()
-        self.out.close()
 
 
 class Stream:
@@ -133,13 +156,15 @@ class Stream:
         self.session = None
         self.video: Relay | None = None
         self.audio: Relay | None = None
+        self.consumers: list[Consumer] = []
+        self.keyframe_wanted = False
         self.started = 0.0
         self.lock = asyncio.Lock()
 
-    def options(self) -> dict:
+    def options(self, live: bool = False) -> dict:
         return {
-            "id": self.id,
-            "name": f"{self.height}p",
+            "id": self.id + LIVE_SUFFIX if live else self.id,
+            "name": f"{self.height}p live" if live else f"{self.height}p",
             "tool": "ffmpeg",
             "video": {"codec": "h264", "width": self.width, "height": self.height},
             "audio": {"codec": "aac", "sampleRate": 16000},
@@ -147,12 +172,10 @@ class Stream:
 
     async def start(self, local_ip: str) -> None:
         loop = asyncio.get_running_loop()
-        video_out, audio_out = _free_port_pair(), _free_port_pair()
-        _, video = await loop.create_datagram_endpoint(lambda: Relay(video_out), local_addr=(local_ip, 0))
-        _, audio = await loop.create_datagram_endpoint(lambda: Relay(audio_out), local_addr=(local_ip, 0))
+        _, video = await loop.create_datagram_endpoint(lambda: Relay(self, True), local_addr=(local_ip, 0))
+        _, audio = await loop.create_datagram_endpoint(lambda: Relay(self, False), local_addr=(local_ip, 0))
         for relay in (video, audio):
             relay.transport.get_extra_info("socket").setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, UDP_BUFFER)
-            relay.out.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, UDP_BUFFER)
         try:
             session = await self.cam.start(
                 local_ip=local_ip,
@@ -164,10 +187,24 @@ class Stream:
             video.close()
             audio.close()
             raise
-        self.sdp_path.write_text(session.sdp("127.0.0.1", video_port=video_out, audio_port=audio_out))
         self.session, self.video, self.audio, self.started = session, video, audio, time.monotonic()
         asyncio.ensure_future(self._send_receiver_reports(session))
         print(f"{self.height}p stream started from {session.accessory_address.ip_address}")
+
+    def attach(self, live: bool) -> Consumer:
+        consumer = Consumer(live, self.sdp_path.with_name(self.sdp_path.stem + "-live.sdp") if live else self.sdp_path)
+        consumer.sdp_path.write_text(self.session.sdp("127.0.0.1", video_port=consumer.video_port, audio_port=consumer.audio_port))
+        # A consumer joining a running session needs a keyframe now: the E1 sends one every 5 s only.
+        if self.consumers:
+            self.keyframe_wanted = True
+        self.consumers.append(consumer)
+        print(f"{self.height}p {'live viewer' if live else 'consumer'} attached")
+        return consumer
+
+    def detach(self, consumer: Consumer) -> None:
+        if consumer in self.consumers:
+            self.consumers.remove(consumer)
+            consumer.close()
 
     async def _send_receiver_reports(self, session) -> None:
         """The accessory ends a session whose controller sends no RTCP; the consumer's ffmpeg reports to localhost only."""
@@ -181,7 +218,17 @@ class Stream:
                 protect = Session(Policy(key=srtp.master_key + srtp.master_salt, ssrc_type=Policy.SSRC_ANY_OUTBOUND)).protect_rtcp
                 # Empty receiver report (RC=0): version 2, PT 201, length 1 word, sender SSRC.
                 reports.append((relay.transport, protect, struct.pack("!BBHI", 0x80, 201, 1, params.rtp_params.ssrc), (address.ip_address, port)))
+        video_ssrc = session.selected.video_params.rtp_params.ssrc
+        fir_seq = 0
         while self.session is session:
+            if self.keyframe_wanted:
+                self.keyframe_wanted = False
+                fir_seq = (fir_seq + 1) & 0xFF
+                transport, protect, report, destination = reports[0]
+                # Picture loss indication (PT 206 FMT 1), then full intra request (FMT 4), after the receiver report.
+                request = struct.pack("!BBHII", 0x81, 206, 2, video_ssrc, session.video_ssrc)
+                request += struct.pack("!BBHIIIB3x", 0x84, 206, 4, video_ssrc, 0, session.video_ssrc, fir_seq)
+                transport.sendto(protect(report + request), destination)
             for transport, protect, report, destination in reports:
                 transport.sendto(protect(report), destination)
             await asyncio.sleep(0.5)
@@ -190,6 +237,9 @@ class Stream:
         if not self.session:
             return
         session, self.session = self.session, None
+        for consumer in self.consumers:
+            consumer.close()
+        self.consumers.clear()
         self.video.close()
         self.audio.close()
         try:
@@ -280,25 +330,33 @@ class HomeKitCamera(ScryptedDeviceBase, VideoCamera, MotionSensor, BinarySensor,
     # Video
 
     async def getVideoStreamOptions(self) -> list:
-        return [stream.options() for stream in self.streams]
+        return [stream.options() for stream in self.streams] + [stream.options(live=True) for stream in self.streams]
 
     async def getVideoStream(self, options: dict = None) -> MediaObject:
         await asyncio.shield(self.ready)
-        stream = next((s for s in self.streams if s.id == (options or {}).get("id")), self.streams[0])
+        id = (options or {}).get("id") or ""
+        live = id.endswith(LIVE_SUFFIX)
+        stream = next((s for s in self.streams if s.id == id.removesuffix(LIVE_SUFFIX)), self.streams[0])
         async with stream.lock:
-            # One session per stream: a new request replaces the session of a consumer that went away.
-            await self._end(stream)
-            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
-                probe.connect((self.accessory_ip, 9))
-                local_ip = probe.getsockname()[0]
-            await stream.start(local_ip)
+            # A new request replaces the consumer of the same kind, whose ffmpeg went away.
+            for consumer in [c for c in stream.consumers if c.live == live]:
+                stream.detach(consumer)
+            # Alone on the stream, a fresh session starts on a keyframe instead of waiting up to 5 s for one.
+            if not stream.consumers:
+                await self._end(stream)
+            if not stream.session:
+                with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+                    probe.connect((self.accessory_ip, 9))
+                    local_ip = probe.getsockname()[0]
+                await stream.start(local_ip)
+            consumer = stream.attach(live)
         await self.update_position()
         return await scrypted_sdk.mediaManager.createFFmpegMediaObject({
             "inputArguments": [
                 "-protocol_whitelist", "file,crypto,data,rtp,udp,srtp", "-buffer_size", str(UDP_BUFFER),
-                "-f", "sdp", "-i", str(stream.sdp_path),
+                "-f", "sdp", "-i", str(consumer.sdp_path),
             ],
-            "mediaStreamOptions": stream.options(),
+            "mediaStreamOptions": stream.options(live),
         })
 
     async def _end(self, stream: Stream) -> None:
@@ -319,14 +377,23 @@ class HomeKitCamera(ScryptedDeviceBase, VideoCamera, MotionSensor, BinarySensor,
                 if not stream.session:
                     continue
                 now = time.monotonic()
-                talking = stream is self.talkback_stream and any(p.returncode is None for p in self.talkback)
-                consumer_gone = now - stream.started > CONSUMER_GRACE and now - stream.video.last_refused < 2 and not talking
-                accessory_silent = now - stream.video.last_packet > ACCESSORY_SILENCE
-                if consumer_gone or accessory_silent:
-                    print(f"{stream.height}p {'consumer gone' if consumer_gone else 'accessory stopped sending'} after {now - stream.started:.0f}s")
+                if now - stream.video.last_packet > ACCESSORY_SILENCE:
+                    print(f"{stream.height}p accessory stopped sending after {now - stream.started:.0f}s")
                     async with stream.lock:
                         await self._end(stream)
                     await self.update_position()
+                    continue
+                talking = stream is self.talkback_stream and any(p.returncode is None for p in self.talkback)
+                gone = [c for c in stream.consumers if now - c.started > CONSUMER_GRACE and now - c.last_refused < 2 and not talking]
+                if not gone:
+                    continue
+                async with stream.lock:
+                    for consumer in gone:
+                        print(f"{stream.height}p {'live viewer' if consumer.live else 'consumer'} gone after {now - consumer.started:.0f}s")
+                        stream.detach(consumer)
+                    if not stream.consumers:
+                        await self._end(stream)
+                await self.update_position()
 
     # Pan/tilt: Aqara Home presets, and the privacy switch picking between two of them
 
@@ -365,10 +432,7 @@ class HomeKitCamera(ScryptedDeviceBase, VideoCamera, MotionSensor, BinarySensor,
         await self.update_position()
 
     def watching(self) -> bool:
-        if self.view_until:
-            return True
-        live = self.storage.getItem("liveStream") or (self.streams[0].id if self.streams else None)
-        return any(s.session for s in self.streams if s.id == live)
+        return bool(self.view_until) or any(c.live for s in self.streams for c in s.consumers)
 
     async def update_position(self) -> None:
         """Faces the privacy preset while privacy is on and nobody watches live, the watch preset otherwise."""
@@ -396,11 +460,6 @@ class HomeKitCamera(ScryptedDeviceBase, VideoCamera, MotionSensor, BinarySensor,
                 "key": "talkbackPort", "title": "Talk-back Port", "type": "number",
                 "description": "TCP port taking raw s16le 16 kHz mono PCM as talk-back while a client stays connected.",
                 "value": self.storage.getItem("talkbackPort"),
-            },
-            {
-                "key": "liveStream", "title": "Live Stream", "choices": [s.id for s in self.streams],
-                "description": "The stream whose session means someone watches live. Keep it out of the prebuffered streams.",
-                "value": self.storage.getItem("liveStream") or (self.streams[0].id if self.streams else None),
             },
         ]
 

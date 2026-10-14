@@ -7,7 +7,8 @@ into Scrypted. The plugin is the camera's HomeKit controller:
   (pair it with Rebroadcast for prebuffering and HomeKit Secure Video)
 - the camera's native motion sensor
 - two-way audio (Intercom), encoded as 480-sample AAC-ELD frames
-- one stream per RTP stream service the camera offers (the E1 has 1080p and 720p)
+- one stream per RTP stream service the camera offers (the E1 has 1080p and 720p),
+  each with a `live` variant sharing its session
 - for Aqara pan/tilt cameras, the presets saved in the Aqara Home app, and a
   privacy switch that turns the camera away unless someone watches live
 
@@ -53,11 +54,17 @@ the session token is kept). Request signing follows
 [Aqara-LANLink](https://github.com/copystring/Aqara-LANLink) (MIT).
 
 Each camera gets a `<Name> Privacy` switch. While it is on, the camera faces
-its Privacy Preset, unless someone watches the Live Stream; then, and while
-the switch is off, it faces its Watch Preset. Keep the Live Stream out of
-Rebroadcast's prebuffered streams (prebuffer and record the other one for
-HomeKit Secure Video), so its session only runs while a viewer is there.
-Drive the switch from presence automations in the Home app.
+its Privacy Preset, unless someone watches live; then, and while the switch
+is off, it faces its Watch Preset. Drive the switch from presence automations
+in the Home app.
+
+Someone watches live while a `live` stream (`720p live`, `1080p live`) has a
+consumer. A `live` stream shares the session of its plain stream, so the
+plain one can stay prebuffered and recorded for HomeKit Secure Video: in
+Rebroadcast, prebuffer only plain streams, and pick a `live` stream as the
+Local, Remote and Low Resolution Stream, with the same FFmpeg arguments as
+its plain stream. A live view joining a running session asks the camera for a
+keyframe, starts within about 2 s, and ends once Rebroadcast drops its ffmpeg.
 
 ## Doorbells, events and talk-back from other apps
 
