@@ -27,8 +27,9 @@ npx scrypted login 127.0.0.1   # once
 ./deploy.py
 ```
 
-The aiohomekit fork with camera streaming (`camera-streaming` branch) is
-expected at `../aiohomekit`, or at `$AIOHOMEKIT`.
+The aiohomekit fork with camera streaming
+([`camera-streaming` branch](https://github.com/Alexays/aiohomekit/tree/camera-streaming))
+is expected at `../aiohomekit`, or at `$AIOHOMEKIT`.
 
 ## Development
 
