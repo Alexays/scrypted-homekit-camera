@@ -50,7 +50,7 @@ from aiohomekit.model import Accessories
 from aiohomekit.model.characteristics import CharacteristicsTypes
 from aiohomekit.model.services import ServicesTypes
 from aiohomekit.zeroconf import HAP_TYPE_TCP, HAP_TYPE_UDP, ZeroconfServiceListener
-from pylibsrtp import Policy, Session
+from pylibsrtp import Error as SrtpError, Policy, Session
 from zeroconf.asyncio import AsyncServiceBrowser, AsyncZeroconf
 
 PAIRINGS_DIR = Path.home() / ".config" / "homekit-cameras"
@@ -122,12 +122,17 @@ class Consumer:
 
 
 class Relay(asyncio.DatagramProtocol):
-    """Forwards the accessory's SRTP packets untouched to every consumer's ffmpeg on localhost."""
+    """Decrypts the accessory's SRTP and forwards plain RTP to every consumer's ffmpeg on localhost.
+
+    Decrypting here, from the session's first packet, tracks the SRTP rollover counter: a consumer
+    joining after the sequence number wrapped would guess it wrong and fail every packet's HMAC.
+    """
 
     def __init__(self, stream: Stream, video: bool) -> None:
         self.stream = stream
         self.video = video
         self.transport: asyncio.DatagramTransport | None = None
+        self.srtp: Session | None = None
         self.last_packet = time.monotonic()
 
     def connection_made(self, transport) -> None:
@@ -135,6 +140,13 @@ class Relay(asyncio.DatagramProtocol):
 
     def datagram_received(self, data: bytes, addr) -> None:
         self.last_packet = time.monotonic()
+        if not self.srtp:
+            return
+        try:
+            # RTCP shares the port (RFC 5761): its packet types sit where RTP payload types never go.
+            data = self.srtp.unprotect_rtcp(data) if 192 <= data[1] <= 223 else self.srtp.unprotect(data)
+        except SrtpError:
+            return
         for consumer in self.stream.consumers:
             try:
                 (consumer.video if self.video else consumer.audio).send(data)
@@ -191,13 +203,18 @@ class Stream:
             video.close()
             audio.close()
             raise
+        for relay, srtp in ((video, session.accessory_video_srtp), (audio, session.accessory_audio_srtp)):
+            relay.srtp = Session(Policy(key=srtp.master_key + srtp.master_salt, ssrc_type=Policy.SSRC_ANY_INBOUND))
         self.session, self.video, self.audio, self.started = session, video, audio, time.monotonic()
         asyncio.ensure_future(self._send_receiver_reports(session))
         print(f"{self.height}p stream started from {session.accessory_address.ip_address}")
 
     def attach(self, live: bool) -> Consumer:
         consumer = Consumer(live, self.sdp_path.with_name(self.sdp_path.stem + "-live.sdp") if live else self.sdp_path)
-        consumer.sdp_path.write_text(self.session.sdp("127.0.0.1", video_port=consumer.video_port, audio_port=consumer.audio_port))
+        sdp = self.session.sdp("127.0.0.1", video_port=consumer.video_port, audio_port=consumer.audio_port)
+        # The relay hands over decrypted RTP.
+        sdp = "".join(line for line in sdp.splitlines(keepends=True) if not line.startswith("a=crypto:"))
+        consumer.sdp_path.write_text(sdp.replace("RTP/SAVP", "RTP/AVP"))
         # A consumer joining a running session needs a keyframe now: the E1 sends one every 5 s only.
         if self.consumers:
             self.keyframe_wanted = True

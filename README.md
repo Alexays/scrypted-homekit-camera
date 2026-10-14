@@ -3,7 +3,7 @@
 Brings cameras paired natively over HomeKit (HAP), such as the Aqara E1 or G4,
 into Scrypted. The plugin is the camera's HomeKit controller:
 
-- live H.264 video and AAC-ELD audio, relayed as SRTP to Scrypted's ffmpeg
+- live H.264 video and AAC-ELD audio, decrypted once and relayed as RTP to Scrypted's ffmpeg
   (pair it with Rebroadcast for prebuffering and HomeKit Secure Video)
 - the camera's native motion sensor
 - two-way audio (Intercom), encoded as 480-sample AAC-ELD frames
