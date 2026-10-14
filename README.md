@@ -7,6 +7,9 @@ into Scrypted. The plugin is the camera's HomeKit controller:
   (pair it with Rebroadcast for prebuffering and HomeKit Secure Video)
 - the camera's native motion sensor
 - two-way audio (Intercom), encoded as 480-sample AAC-ELD frames
+- one stream per RTP stream service the camera offers (the E1 has 1080p and 720p)
+- for Aqara pan/tilt cameras, the presets saved in the Aqara Home app, and a
+  privacy switch that turns the camera away unless someone watches live
 
 A HomeKit accessory accepts a single controller, so a camera used here is not
 in the Apple Home app directly; re-expose it with the Scrypted HomeKit plugin.
@@ -28,6 +31,22 @@ the streaming side of HAP, so this relies on a fork that adds it: stream
 negotiation, SRTP keys, and the
 AAC-ELD framing (480-sample frames, one access unit per packet) the cameras
 expect for talk-back.
+
+## Pan/tilt and privacy
+
+Aqara cameras such as the E1 take pan/tilt moves only from the Aqara cloud:
+the Aqara Home app itself sends them there, never over the local network. The
+plugin does the same, with the presets saved in the app, once you log in to
+your Aqara account in the plugin settings (the password only serves the login;
+the session token is kept). Request signing follows
+[Aqara-LANLink](https://github.com/copystring/Aqara-LANLink) (MIT).
+
+Each camera gets a `<Name> Privacy` switch. While it is on, the camera faces
+its Privacy Preset, unless someone watches the Live Stream; then, and while
+the switch is off, it faces its Watch Preset. Keep the Live Stream out of
+Rebroadcast's prebuffered streams (prebuffer and record the other one for
+HomeKit Secure Video), so its session only runs while a viewer is there.
+Drive the switch from presence automations in the Home app.
 
 ## Cameras
 

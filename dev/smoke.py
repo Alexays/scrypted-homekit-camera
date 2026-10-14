@@ -20,9 +20,18 @@ ROOT = Path(__file__).resolve().parent.parent
 FFMPEG = shutil.which("ffmpeg")
 
 
+class Storage(dict):
+    def getItem(self, key):
+        return self.get(key)
+
+    def setItem(self, key, value):
+        self[key] = value
+
+
 class ScryptedDeviceBase:
     def __init__(self, nativeId=None):
         self.nativeId = nativeId
+        self.storage = Storage()
 
     def __setattr__(self, name, value):
         if name == "motionDetected":
@@ -51,10 +60,12 @@ sdk.ScryptedDeviceBase = ScryptedDeviceBase
 sdk.mediaManager = MediaManager()
 sdk.deviceManager = DeviceManager()
 sdk_types = types.ModuleType("scrypted_sdk.types")
-for name in ("DeviceProvider", "Intercom", "MediaObject", "MotionSensor", "VideoCamera"):
+for name in ("DeviceProvider", "Intercom", "MediaObject", "MotionSensor", "OnOff", "PanTiltZoom", "Settings", "VideoCamera"):
     setattr(sdk_types, name, type(name, (), {}))
-sdk_types.ScryptedDeviceType = enum.Enum("ScryptedDeviceType", {"Camera": "Camera"})
-sdk_types.ScryptedInterface = enum.Enum("ScryptedInterface", {n: n for n in ("VideoCamera", "MotionSensor", "Intercom")})
+sdk_types.ScryptedDeviceType = enum.Enum("ScryptedDeviceType", {"Camera": "Camera", "Switch": "Switch"})
+sdk_types.ScryptedInterface = enum.Enum(
+    "ScryptedInterface", {n: n for n in ("VideoCamera", "MotionSensor", "Intercom", "PanTiltZoom", "Settings", "OnOff")}
+)
 sdk_types.ScryptedMimeTypes = enum.Enum("ScryptedMimeTypes", {"FFmpegInput": "x-scrypted/x-ffmpeg-input"})
 sys.modules["scrypted_sdk"] = sdk
 sys.modules["scrypted_sdk.types"] = sdk_types
