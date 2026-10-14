@@ -51,6 +51,8 @@ from zeroconf.asyncio import AsyncServiceBrowser, AsyncZeroconf
 PAIRINGS_DIR = Path.home() / ".config" / "homekit-cameras"
 ELD_ENCODER = Path(__file__).parent / "eld_encoder"
 MAX_BITRATE = 2000  # kbps
+# 1080p keyframes arrive as bursts of a few hundred packets; the 786 KB macOS default drops some.
+UDP_BUFFER = 4 << 20
 # The consumer's ffmpeg takes a while to open the SDP; relays refused before then are expected.
 CONSUMER_GRACE = 20
 ACCESSORY_SILENCE = 10
@@ -138,6 +140,9 @@ class Stream:
         video_out, audio_out = _free_port_pair(), _free_port_pair()
         _, video = await loop.create_datagram_endpoint(lambda: Relay(video_out), local_addr=(local_ip, 0))
         _, audio = await loop.create_datagram_endpoint(lambda: Relay(audio_out), local_addr=(local_ip, 0))
+        for relay in (video, audio):
+            relay.transport.get_extra_info("socket").setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, UDP_BUFFER)
+            relay.out.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, UDP_BUFFER)
         try:
             session = await self.cam.start(
                 local_ip=local_ip,
@@ -253,7 +258,10 @@ class HomeKitCamera(ScryptedDeviceBase, VideoCamera, MotionSensor, Intercom, Pan
             await stream.start(local_ip)
         await self.update_position()
         return await scrypted_sdk.mediaManager.createFFmpegMediaObject({
-            "inputArguments": ["-protocol_whitelist", "file,crypto,data,rtp,udp,srtp", "-f", "sdp", "-i", str(stream.sdp_path)],
+            "inputArguments": [
+                "-protocol_whitelist", "file,crypto,data,rtp,udp,srtp", "-buffer_size", str(UDP_BUFFER),
+                "-f", "sdp", "-i", str(stream.sdp_path),
+            ],
             "mediaStreamOptions": stream.options(),
         })
 
