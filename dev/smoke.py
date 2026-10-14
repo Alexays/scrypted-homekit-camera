@@ -29,6 +29,8 @@ class Storage(dict):
 
 
 class ScryptedDeviceBase:
+    name = "camera"
+
     def __init__(self, nativeId=None):
         self.nativeId = nativeId
         self.storage = Storage()
@@ -54,17 +56,23 @@ class DeviceManager:
     async def onDevicesChanged(self, manifest):
         print(f"[sdk] devices: {[d['nativeId'] for d in manifest['devices']]}")
 
+    async def onDeviceDiscovered(self, device):
+        print(f"[sdk] device updated: {device['nativeId']} ({device['type']})")
+
+    def getDeviceStorage(self, nativeId):
+        return Storage()
+
 
 sdk = types.ModuleType("scrypted_sdk")
 sdk.ScryptedDeviceBase = ScryptedDeviceBase
 sdk.mediaManager = MediaManager()
 sdk.deviceManager = DeviceManager()
 sdk_types = types.ModuleType("scrypted_sdk.types")
-for name in ("DeviceProvider", "Intercom", "MediaObject", "MotionSensor", "OnOff", "PanTiltZoom", "Settings", "VideoCamera"):
+for name in ("BinarySensor", "DeviceProvider", "Intercom", "MediaObject", "MotionSensor", "OnOff", "PanTiltZoom", "Settings", "VideoCamera"):
     setattr(sdk_types, name, type(name, (), {}))
-sdk_types.ScryptedDeviceType = enum.Enum("ScryptedDeviceType", {"Camera": "Camera", "Switch": "Switch"})
+sdk_types.ScryptedDeviceType = enum.Enum("ScryptedDeviceType", {"Camera": "Camera", "Doorbell": "Doorbell", "Switch": "Switch"})
 sdk_types.ScryptedInterface = enum.Enum(
-    "ScryptedInterface", {n: n for n in ("VideoCamera", "MotionSensor", "Intercom", "PanTiltZoom", "Settings", "OnOff")}
+    "ScryptedInterface", {n: n for n in ("VideoCamera", "MotionSensor", "BinarySensor", "Intercom", "PanTiltZoom", "Settings", "OnOff")}
 )
 sdk_types.ScryptedMimeTypes = enum.Enum("ScryptedMimeTypes", {"FFmpegInput": "x-scrypted/x-ffmpeg-input"})
 sys.modules["scrypted_sdk"] = sdk

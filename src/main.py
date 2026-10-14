@@ -5,7 +5,8 @@ Scrypted becomes the HomeKit controller of cameras paired natively over HAP
 consumer's ffmpeg, mirrors the native motion sensor, sends talk-back as
 AAC-ELD, and turns Aqara pan/tilt cameras to their presets through the Aqara cloud.
 Each `<name>.pairing` file (aiohomekit pairing data) in PAIRINGS_DIR is one
-camera, with a companion privacy switch.
+camera, with a companion privacy switch; doorbells ring, push their events to a
+webhook, and take talk-back as raw PCM over TCP as well.
 """
 from __future__ import annotations
 
@@ -18,11 +19,13 @@ import socket
 import struct
 import tempfile
 import time
+import urllib.request
 from pathlib import Path
 
 import scrypted_sdk
 from scrypted_sdk import ScryptedDeviceBase
 from scrypted_sdk.types import (
+    BinarySensor,
     DeviceProvider,
     Intercom,
     MediaObject,
@@ -59,6 +62,8 @@ ACCESSORY_SILENCE = 10
 # Aqara's vendor characteristic holding the device id the Aqara cloud knows the camera by.
 AQARA_DID = "C7EECAA7-91D9-40EB-AD0C-FFDDE3143CB9"
 PRIVACY_SUFFIX = ":privacy"
+# How long a ring keeps the doorbell's binary state on; HomeKit rings on the rising edge.
+RING_HOLD = 5
 
 STREAM_CHARACTERISTICS = {
     "streaming_status": CharacteristicsTypes.STREAMING_STATUS,
@@ -189,7 +194,7 @@ class Stream:
             print(f"{self.height}p stream end failed: {type(exc).__name__}: {exc}")
 
 
-class HomeKitCamera(ScryptedDeviceBase, VideoCamera, MotionSensor, Intercom, PanTiltZoom, Settings):
+class HomeKitCamera(ScryptedDeviceBase, VideoCamera, MotionSensor, BinarySensor, Intercom, PanTiltZoom, Settings):
     def __init__(self, nativeId: str, controller: Controller, plugin: HomeKitCamerasPlugin) -> None:
         super().__init__(nativeId)
         self.plugin = plugin
@@ -203,6 +208,8 @@ class HomeKitCamera(ScryptedDeviceBase, VideoCamera, MotionSensor, Intercom, Pan
         self.privacy: PrivacySwitch | None = None
         self.talkback: list[asyncio.subprocess.Process] = []
         self.talkback_stream: Stream | None = None
+        self.ring_reset: asyncio.TimerHandle | None = None
+        self.talk_server: asyncio.base_events.Server | None = None
         self.ready = asyncio.ensure_future(self._connect())
         asyncio.ensure_future(self._watch())
 
@@ -224,22 +231,45 @@ class HomeKitCamera(ScryptedDeviceBase, VideoCamera, MotionSensor, Intercom, Pan
             self.streams.append(Stream(str(service.iid), cam, attrs, sdp_path))
         self.streams.sort(key=lambda s: s.width * s.height, reverse=True)
 
+        handlers = {}
         motion = accessory.services.first(service_type=ServicesTypes.MOTION_SENSOR)
         if motion:
             char = motion[CharacteristicsTypes.MOTION_DETECTED]
-            key = (accessory.aid, char.iid)
+            handlers[(accessory.aid, char.iid)] = self._on_motion
             self.motionDetected = bool(char.value)
+        doorbell = accessory.services.first(service_type=ServicesTypes.DOORBELL)
+        if doorbell:
+            handlers[(accessory.aid, doorbell[CharacteristicsTypes.INPUT_EVENT].iid)] = self._on_ring
+            self.binaryState = False
+            if not self.storage.getItem("doorbell"):
+                self.storage.setItem("doorbell", "true")
+                await scrypted_sdk.deviceManager.onDeviceDiscovered(self.plugin.manifest(self.nativeId, doorbell=True))
+        if handlers:
 
             def on_event(events: dict) -> None:
-                if key in events:
-                    self.motionDetected = bool(events[key]["value"])
+                for key, handler in handlers.items():
+                    if key in events:
+                        handler(events[key]["value"])
 
             self.pairing.dispatcher_connect(on_event)
-            await self.pairing.subscribe([key])
+            await self.pairing.subscribe(list(handlers))
 
         self.did = next((c.value for s in accessory.services for c in s.characteristics if c.type == AQARA_DID), None)
-        print(f"ready: streams {[f'{s.width}x{s.height}' for s in self.streams]}, motion sensor: {bool(motion)}, aqara did: {self.did}")
+        print(f"ready: streams {[f'{s.width}x{s.height}' for s in self.streams]}, motion sensor: {bool(motion)}, doorbell: {bool(doorbell)}, aqara did: {self.did}")
+        await self.serve_talkback()
         await self.load_presets()
+
+    def _on_motion(self, value) -> None:
+        self.motionDetected = bool(value)
+        self.plugin.notify(self.name, "motion", bool(value))
+
+    def _on_ring(self, value) -> None:
+        # Any press (single, double, long) rings; the reset lets HomeKit see the next rising edge.
+        self.binaryState = True
+        self.plugin.notify(self.name, "ring", True)
+        if self.ring_reset:
+            self.ring_reset.cancel()
+        self.ring_reset = asyncio.get_running_loop().call_later(RING_HOLD, setattr, self, "binaryState", False)
 
     # Video
 
@@ -344,6 +374,11 @@ class HomeKitCamera(ScryptedDeviceBase, VideoCamera, MotionSensor, Intercom, Pan
                 "value": self.storage.getItem("watchPreset"),
             },
             {
+                "key": "talkbackPort", "title": "Talk-back Port", "type": "number",
+                "description": "TCP port taking raw s16le 16 kHz mono PCM as talk-back while a client stays connected.",
+                "value": self.storage.getItem("talkbackPort"),
+            },
+            {
                 "key": "liveStream", "title": "Live Stream", "choices": [s.id for s in self.streams],
                 "description": "The stream whose session means someone watches live. Keep it out of the prebuffered streams.",
                 "value": self.storage.getItem("liveStream") or (self.streams[0].id if self.streams else None),
@@ -351,21 +386,34 @@ class HomeKitCamera(ScryptedDeviceBase, VideoCamera, MotionSensor, Intercom, Pan
         ]
 
     async def putSetting(self, key: str, value) -> None:
-        self.storage.setItem(key, value)
+        self.storage.setItem(key, str(value) if key == "talkbackPort" else value)
+        if key == "talkbackPort":
+            await self.serve_talkback()
         await self.update_position()
         await scrypted_sdk.deviceManager.onDeviceEvent(self.nativeId, ScryptedInterface.Settings.value, None)
 
     # Talk-back
 
-    async def startIntercom(self, media: MediaObject) -> None:
+    async def _talk_stream(self) -> Stream:
+        """Talk-back rides on a running session; the live view normally has one open."""
         await asyncio.shield(self.ready)
-        self._stop_talkback()
-        # Talk-back rides on a running session; the live view normally has one open.
         stream = next((s for s in self.streams if s.session), None)
         if not stream:
             await self.getVideoStream()
             stream = self.streams[0]
-        session = stream.session
+        return stream
+
+    async def _start_encoder(self, stream: Stream, stdin) -> asyncio.subprocess.Process:
+        # fdk-aac through ffmpeg cannot produce the 480-sample frames HomeKit accessories decode.
+        encoder = await asyncio.create_subprocess_exec(
+            str(ELD_ENCODER), stdin=stdin, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL
+        )
+        asyncio.ensure_future(self._send_talkback(stream.session, stream.audio.transport, encoder.stdout))
+        return encoder
+
+    async def startIntercom(self, media: MediaObject) -> None:
+        self._stop_talkback()
+        stream = await self._talk_stream()
         source = await scrypted_sdk.mediaManager.convertMediaObjectToJSON(media, ScryptedMimeTypes.FFmpegInput.value)
         ffmpeg = await scrypted_sdk.mediaManager.getFFmpegPath()
         pcm_read, pcm_write = os.pipe()
@@ -374,14 +422,40 @@ class HomeKitCamera(ScryptedDeviceBase, VideoCamera, MotionSensor, Intercom, Pan
             "-vn", "-ac", "1", "-ar", "16000", "-f", "s16le", "pipe:1",
             stdout=pcm_write,
         )
-        # fdk-aac through ffmpeg cannot produce the 480-sample frames HomeKit accessories decode.
-        encoder = await asyncio.create_subprocess_exec(
-            str(ELD_ENCODER), stdin=pcm_read, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL
-        )
+        encoder = await self._start_encoder(stream, pcm_read)
         os.close(pcm_read)
         os.close(pcm_write)
         self.talkback, self.talkback_stream = [decoder, encoder], stream
-        asyncio.ensure_future(self._send_talkback(session, stream.audio.transport, encoder.stdout))
+
+    async def serve_talkback(self) -> None:
+        if self.talk_server:
+            self.talk_server.close()
+            self.talk_server = None
+        port = self.storage.getItem("talkbackPort")
+        if port:
+            self.talk_server = await asyncio.start_server(self._on_talk_client, "0.0.0.0", int(port))
+
+    async def _on_talk_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        """Raw s16le 16 kHz mono PCM in, talk-back out, for as long as the client stays connected.
+
+        Skips ffmpeg entirely, so the only added latency is one 30 ms AAC-ELD frame.
+        """
+        self._stop_talkback()
+        stream = await self._talk_stream()
+        encoder = await self._start_encoder(stream, asyncio.subprocess.PIPE)
+        self.talkback, self.talkback_stream = [encoder], stream
+        try:
+            while chunk := await reader.read(4096):
+                if encoder.returncode is not None:
+                    break
+                encoder.stdin.write(chunk)
+                await encoder.stdin.drain()
+        except ConnectionError:
+            pass
+        finally:
+            if encoder.returncode is None:
+                encoder.stdin.close()
+            writer.close()
 
     async def _send_talkback(self, session, transport, aus: asyncio.StreamReader) -> None:
         srtp = session.controller_audio_srtp
@@ -453,19 +527,8 @@ class HomeKitCamerasPlugin(ScryptedDeviceBase, DeviceProvider, Settings):
         await self.controller.async_start()
         devices = []
         for path in sorted(PAIRINGS_DIR.glob("*.pairing")):
-            devices.append({
-                "nativeId": path.stem,
-                "name": path.stem,
-                "type": ScryptedDeviceType.Camera.value,
-                "interfaces": [
-                    ScryptedInterface.VideoCamera.value,
-                    ScryptedInterface.MotionSensor.value,
-                    ScryptedInterface.Intercom.value,
-                    ScryptedInterface.PanTiltZoom.value,
-                    ScryptedInterface.Settings.value,
-                ],
-                "info": {"manufacturer": "HomeKit"},
-            })
+            doorbell = bool(scrypted_sdk.deviceManager.getDeviceStorage(path.stem).getItem("doorbell"))
+            devices.append(self.manifest(path.stem, doorbell))
             devices.append({
                 "nativeId": path.stem + PRIVACY_SUFFIX,
                 "name": f"{path.stem} Privacy",
@@ -473,6 +536,38 @@ class HomeKitCamerasPlugin(ScryptedDeviceBase, DeviceProvider, Settings):
                 "interfaces": [ScryptedInterface.OnOff.value],
             })
         await scrypted_sdk.deviceManager.onDevicesChanged({"devices": devices})
+
+    def manifest(self, nativeId: str, doorbell: bool = False) -> dict:
+        interfaces = [
+            ScryptedInterface.VideoCamera.value,
+            ScryptedInterface.MotionSensor.value,
+            ScryptedInterface.Intercom.value,
+            ScryptedInterface.PanTiltZoom.value,
+            ScryptedInterface.Settings.value,
+        ]
+        return {
+            "nativeId": nativeId,
+            "name": nativeId,
+            "type": (ScryptedDeviceType.Doorbell if doorbell else ScryptedDeviceType.Camera).value,
+            "interfaces": interfaces + ([ScryptedInterface.BinarySensor.value] if doorbell else []),
+            "info": {"manufacturer": "HomeKit"},
+        }
+
+    def notify(self, camera: str, event: str, state: bool) -> None:
+        """Posts a camera event to the webhook (a Home Assistant webhook trigger) without holding up the caller."""
+        url = self.storage.getItem("eventWebhook")
+        if not url:
+            return
+        body = json.dumps({"camera": camera, "event": event, "state": state}).encode()
+
+        def post() -> None:
+            request = urllib.request.Request(url, data=body, method="POST", headers={"Content-Type": "application/json"})
+            try:
+                urllib.request.urlopen(request, timeout=5).close()
+            except Exception as exc:
+                print(f"event webhook failed: {exc}")
+
+        asyncio.get_running_loop().run_in_executor(None, post)
 
     async def _shutdown(self) -> None:
         # Scrypted sends SIGKILL one second after SIGTERM. A camera left streaming to a
@@ -502,6 +597,11 @@ class HomeKitCamerasPlugin(ScryptedDeviceBase, DeviceProvider, Settings):
             {
                 "key": "aqaraPassword", "title": "Aqara Password", "type": "password", "value": "",
                 "description": "Logs in when set; only the session token is stored.",
+            },
+            {
+                "key": "eventWebhook", "title": "Event Webhook",
+                "description": "URL getting a JSON POST {camera, event: ring|motion, state} on each camera event.",
+                "value": self.storage.getItem("eventWebhook"),
             },
             {
                 "key": "aqaraStatus", "title": "Aqara Login", "readonly": True,
