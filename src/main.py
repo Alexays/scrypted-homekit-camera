@@ -56,6 +56,9 @@ from zeroconf.asyncio import AsyncServiceBrowser, AsyncZeroconf
 PAIRINGS_DIR = Path.home() / ".config" / "homekit-cameras"
 ELD_ENCODER = Path(__file__).parent / "eld_encoder"
 MAX_BITRATE = 2000  # kbps
+# HomeKit asks 132 to 299 kbps for a remote view, which Rebroadcast serves from the smaller stream;
+# the Aqara G4 overshoots its cap by about a quarter.
+SECONDARY_BITRATE = 200  # kbps
 # 1080p keyframes arrive as bursts of a few hundred packets; the 786 KB macOS default drops some.
 UDP_BUFFER = 4 << 20
 # The consumer's ffmpeg takes a while to open the SDP; relays refused before then are expected.
@@ -152,6 +155,7 @@ class Stream:
         self.id = id
         self.cam = cam
         self.width, self.height, self.fps = attrs.width, attrs.height, attrs.fps
+        self.max_bitrate = MAX_BITRATE
         self.sdp_path = sdp_path
         self.session = None
         self.video: Relay | None = None
@@ -181,7 +185,7 @@ class Stream:
                 local_ip=local_ip,
                 video_port=video.transport.get_extra_info("sockname")[1],
                 audio_port=audio.transport.get_extra_info("sockname")[1],
-                width=self.width, height=self.height, fps=self.fps, audio=True, max_bitrate=MAX_BITRATE,
+                width=self.width, height=self.height, fps=self.fps, audio=True, max_bitrate=self.max_bitrate,
             )
         except Exception:
             video.close()
@@ -286,6 +290,8 @@ class HomeKitCamera(ScryptedDeviceBase, VideoCamera, MotionSensor, BinarySensor,
             sdp_path = Path(tempfile.gettempdir()) / f"homekit-camera-{self.nativeId}-{service.iid}.sdp"
             self.streams.append(Stream(str(service.iid), cam, attrs, sdp_path))
         self.streams.sort(key=lambda s: s.width * s.height, reverse=True)
+        for stream in self.streams[1:]:
+            stream.max_bitrate = SECONDARY_BITRATE
 
         handlers = {}
         motion = accessory.services.first(service_type=ServicesTypes.MOTION_SENSOR)
