@@ -1,0 +1,16 @@
+{
+  "name": "scrypted-homekit-camera",
+  "version": "0.1.0",
+  "description": "Cameras paired natively over HomeKit (HAP), with live video, motion and two-way audio",
+  "license": "Apache-2.0",
+  "scrypted": {
+    "name": "HomeKit Accessory Cameras",
+    "runtime": "python",
+    "type": "DeviceProvider",
+    "interfaces": ["DeviceProvider"],
+    "pluginDependencies": ["@scrypted/prebuffer-mixin", "@scrypted/snapshot"]
+  },
+  "devDependencies": {
+    "@scrypted/sdk": "0.5.59"
+  }
+}
