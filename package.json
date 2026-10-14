@@ -7,7 +7,7 @@
     "name": "HomeKit Accessory Cameras",
     "runtime": "python",
     "type": "DeviceProvider",
-    "interfaces": ["DeviceProvider", "Settings"],
+    "interfaces": ["DeviceProvider", "Settings", "HttpRequestHandler"],
     "pluginDependencies": ["@scrypted/prebuffer-mixin", "@scrypted/snapshot"]
   },
   "devDependencies": {

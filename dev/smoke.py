@@ -68,7 +68,7 @@ sdk.ScryptedDeviceBase = ScryptedDeviceBase
 sdk.mediaManager = MediaManager()
 sdk.deviceManager = DeviceManager()
 sdk_types = types.ModuleType("scrypted_sdk.types")
-for name in ("BinarySensor", "DeviceProvider", "Intercom", "MediaObject", "MotionSensor", "OnOff", "PanTiltZoom", "Settings", "VideoCamera"):
+for name in ("BinarySensor", "DeviceProvider", "HttpRequestHandler", "Intercom", "MediaObject", "MotionSensor", "OnOff", "PanTiltZoom", "Settings", "VideoCamera"):
     setattr(sdk_types, name, type(name, (), {}))
 sdk_types.ScryptedDeviceType = enum.Enum("ScryptedDeviceType", {"Camera": "Camera", "Doorbell": "Doorbell", "Switch": "Switch"})
 sdk_types.ScryptedInterface = enum.Enum(

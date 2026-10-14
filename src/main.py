@@ -19,6 +19,7 @@ import socket
 import struct
 import tempfile
 import time
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -27,6 +28,7 @@ from scrypted_sdk import ScryptedDeviceBase
 from scrypted_sdk.types import (
     BinarySensor,
     DeviceProvider,
+    HttpRequestHandler,
     Intercom,
     MediaObject,
     MotionSensor,
@@ -64,6 +66,9 @@ AQARA_DID = "C7EECAA7-91D9-40EB-AD0C-FFDDE3143CB9"
 PRIVACY_SUFFIX = ":privacy"
 # How long a ring keeps the doorbell's binary state on; HomeKit rings on the rising edge.
 RING_HOLD = 5
+# A viewer outside HomeKit (a dashboard) renews its watch lease every few seconds; a lapsed lease
+# means it went away without saying so.
+VIEW_LEASE = 15
 
 STREAM_CHARACTERISTICS = {
     "streaming_status": CharacteristicsTypes.STREAMING_STATUS,
@@ -209,6 +214,7 @@ class HomeKitCamera(ScryptedDeviceBase, VideoCamera, MotionSensor, BinarySensor,
         self.talkback: list[asyncio.subprocess.Process] = []
         self.talkback_stream: Stream | None = None
         self.ring_reset: asyncio.TimerHandle | None = None
+        self.view_until = 0.0  # watch lease of a viewer outside HomeKit
         self.talk_server: asyncio.base_events.Server | None = None
         self.ready = asyncio.ensure_future(self._connect())
         asyncio.ensure_future(self._watch())
@@ -306,6 +312,9 @@ class HomeKitCamera(ScryptedDeviceBase, VideoCamera, MotionSensor, BinarySensor,
     async def _watch(self) -> None:
         while True:
             await asyncio.sleep(2)
+            if self.view_until and time.monotonic() > self.view_until:
+                self.view_until = 0.0
+                await self.update_position()
             for stream in self.streams:
                 if not stream.session:
                     continue
@@ -347,7 +356,14 @@ class HomeKitCamera(ScryptedDeviceBase, VideoCamera, MotionSensor, BinarySensor,
         self.preset = preset
         print(f"turned to preset {preset}")
 
+    async def view(self, watching: bool) -> None:
+        """A viewer outside HomeKit starts, renews or ends watching live."""
+        self.view_until = time.monotonic() + VIEW_LEASE if watching else 0.0
+        await self.update_position()
+
     def watching(self) -> bool:
+        if self.view_until:
+            return True
         live = self.storage.getItem("liveStream") or (self.streams[0].id if self.streams else None)
         return any(s.session for s in self.streams if s.id == live)
 
@@ -506,7 +522,7 @@ class PrivacySwitch(ScryptedDeviceBase, OnOff):
         await self.camera.update_position()
 
 
-class HomeKitCamerasPlugin(ScryptedDeviceBase, DeviceProvider, Settings):
+class HomeKitCamerasPlugin(ScryptedDeviceBase, DeviceProvider, Settings, HttpRequestHandler):
     def __init__(self) -> None:
         super().__init__()
         self.devices: dict[str, HomeKitCamera | PrivacySwitch] = {}
@@ -625,6 +641,18 @@ class HomeKitCamerasPlugin(ScryptedDeviceBase, DeviceProvider, Settings):
             if key == "aqaraRegion":
                 self.cloud.region = value
         await scrypted_sdk.deviceManager.onDeviceEvent(None, ScryptedInterface.Settings.value, None)
+
+    async def onRequest(self, request: dict, response) -> None:
+        """GET <endpoint>/public/watch?camera=<name>&watching=1|0: a dashboard opening, renewing or closing a live view."""
+        url = urllib.parse.urlparse(request["url"])
+        query = urllib.parse.parse_qs(url.query)
+        name = query.get("camera", [""])[0]
+        camera = next((d for d in self.devices.values() if isinstance(d, HomeKitCamera) and name in (d.name, d.nativeId)), None)
+        if not url.path.endswith("/watch") or not camera:
+            response.send("not found", {"code": 404})
+            return
+        await camera.view(query.get("watching", ["1"])[0] == "1")
+        response.send("ok", {"code": 200, "headers": {"Access-Control-Allow-Origin": "*"}})
 
     async def releaseDevice(self, id: str, nativeId: str) -> None:
         device = self.devices.pop(nativeId, None)
