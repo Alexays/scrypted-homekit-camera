@@ -22,6 +22,7 @@ import time
 import urllib.parse
 import urllib.request
 from pathlib import Path
+from types import SimpleNamespace
 
 import scrypted_sdk
 from scrypted_sdk import ScryptedDeviceBase
@@ -74,6 +75,8 @@ RING_HOLD = 5
 VIEW_LEASE = 15
 # Stream id suffix of a stream's live variant: it shares the session, and its consumer means someone watches.
 LIVE_SUFFIX = "-live"
+# Device storage key prefix holding the id of a stream's open session, so the next run can end it.
+SESSION_KEY = "session:"
 
 STREAM_CHARACTERISTICS = {
     "streaming_status": CharacteristicsTypes.STREAMING_STATUS,
@@ -88,7 +91,8 @@ STREAM_CHARACTERISTICS = {
 def _free_port_pair() -> int:
     """An even port whose successor is free too: ffmpeg binds RTP there and RTCP on port + 1."""
     while True:
-        port = random.randrange(40000, 60000, 2)
+        # Below the macOS ephemeral range (49152 and up), where any socket bound to port 0 could take it before ffmpeg.
+        port = random.randrange(30000, 49152, 2)
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as rtp, socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as rtcp:
             try:
                 rtp.bind(("", port))
@@ -309,6 +313,18 @@ class HomeKitCamera(ScryptedDeviceBase, VideoCamera, MotionSensor, BinarySensor,
         self.streams.sort(key=lambda s: s.width * s.height, reverse=True)
         for stream in self.streams[1:]:
             stream.max_bitrate = SECONDARY_BITRATE
+        # A session left open by a previous run (killed, crashed, server down) keeps the camera busy:
+        # new sessions get BUSY, and a camera streaming to a vanished controller can stop answering.
+        for stream in self.streams:
+            stale = self.storage.getItem(SESSION_KEY + stream.id)
+            if not stale:
+                continue
+            try:
+                await stream.cam.stop(SimpleNamespace(session_id=bytes.fromhex(stale)))
+                print(f"{stream.height}p session left open by the previous run ended")
+            except Exception as exc:
+                print(f"{stream.height}p session left open by the previous run already gone: {exc}")
+            self.storage.removeItem(SESSION_KEY + stream.id)
 
         handlers = {}
         motion = accessory.services.first(service_type=ServicesTypes.MOTION_SENSOR)
@@ -372,6 +388,7 @@ class HomeKitCamera(ScryptedDeviceBase, VideoCamera, MotionSensor, BinarySensor,
                     probe.connect((self.accessory_ip, 9))
                     local_ip = probe.getsockname()[0]
                 await stream.start(local_ip)
+                self.storage.setItem(SESSION_KEY + stream.id, stream.session.session_id.hex())
             consumer = stream.attach(live)
         await self.update_position()
         return await scrypted_sdk.mediaManager.createFFmpegMediaObject({
@@ -386,6 +403,7 @@ class HomeKitCamera(ScryptedDeviceBase, VideoCamera, MotionSensor, BinarySensor,
         if stream is self.talkback_stream:
             self._stop_talkback()
         await stream.end()
+        self.storage.removeItem(SESSION_KEY + stream.id)
 
     async def end_all(self) -> None:
         await asyncio.gather(*(self._end(stream) for stream in self.streams))
